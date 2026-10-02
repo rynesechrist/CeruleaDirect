@@ -6,4 +6,4 @@ with Lucas Falk and Bläckfisk Publishing, published through the Heroes of Cerul
 Party License. Heroes of Cerulea is copyright
 Lucas Falk and Bläckfisk Publishing.
 
-This is the official build. This is a free tool and you should never need to pay for it. AI was used to help build this tool.
+This is the official location to find the latest build of the tool. This is a free tool and you should never need to pay for it. AI was used to help build this tool.
