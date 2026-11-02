@@ -207,7 +207,7 @@
       border: 3px solid var(--border);
       border-radius: 8px;
       padding: 8px;
-      z-index: 40;
+      z-index: 80;
       box-shadow: 0 8px 20px rgba(0,0,0,0.6);
     }
     /* Click-to-open instead of hover (moving the cursor across the gap into
@@ -432,6 +432,7 @@
     canvas { image-rendering: pixelated; touch-action: none; }
     #canvas-frame {
       position: relative;
+      z-index: 1;
       display: inline-block;
       width: 100%;
       max-width: 1200px;
@@ -672,6 +673,7 @@
        the map never reflows while a panel is open. */
     #left-toolbar {
       position: relative;
+      z-index: 70;
       display: none;
       flex-direction: column;
       align-items: center;
@@ -702,7 +704,7 @@
       position: absolute;
       left: calc(100% + 8px);
       top: 0;
-      z-index: 30;
+      z-index: 70;
       width: 340px;
       max-height: 80vh;
       overflow-y: auto;
@@ -723,6 +725,8 @@
        widened so two 150px buttons + gap still fit next to it. */
     #lt-panel-legend { width: min(380px, 90vw); }
     #game-sidebar {
+      position: relative;
+      z-index: 10;
       flex: 1 1 300px;
       max-width: 420px;
       display: flex;
@@ -1675,7 +1679,6 @@
           <div id="name-tags"></div>
           <div id="status-badges"></div>
           <div id="status-popup"></div>
-          <div id="ctx-menu"></div>
           <div id="dialogue-box" onclick="hideDialogue()" title="Click to close">
             <div id="dialogue-speaker"></div>
             <div id="dialogue-text"></div>
@@ -1944,7 +1947,7 @@
     // player can only join a lobby whose host has the exact same version —
     // mismatched copies can disagree about map data and messages in ways
     // that break the session, so they're turned away with an explanation.
-    const GAME_VERSION = '1.4.5';
+    const GAME_VERSION = '1.4.6';
     (() => { const el = document.getElementById('game-version-label'); if (el) el.textContent = 'Version ' + GAME_VERSION; })();
 
     const PLAYER_COLORS = [
@@ -6006,12 +6009,33 @@
       }
     }
 
-    // Last-resort save for a host who closes the tab shortly before the next
-    // autosaveTick — localStorage writes are synchronous, so this reliably
-    // completes even during unload.
-    window.addEventListener('beforeunload', () => {
-      if (gameMode !== 'CLIENT' && selectedCampaignKey) saveCurrentMap();
-    });
+    // Clean unload handler for tab close, refresh, or navigation.
+    // Host saves current map; client notifies host to drop player immediately;
+    // host notifies clients that lobby closed.
+    function handleAppUnload() {
+      if (gameMode !== 'CLIENT' && selectedCampaignKey) {
+        saveCurrentMap();
+      }
+      if (gameMode === 'CLIENT' && hostConn) {
+        try {
+          hostConn.send({ type: 'LEAVE_LOBBY', playerId: myPlayerId });
+          hostConn.close();
+        } catch (e) {}
+        if (peer) {
+          try { peer.destroy(); } catch (e) {}
+        }
+      } else if (gameMode === 'HOST' && connections && connections.length) {
+        try {
+          broadcastToClients({ type: 'HOST_CLOSED' });
+          connections.forEach(c => { try { c.close(); } catch (e) {} });
+        } catch (e) {}
+        if (peer) {
+          try { peer.destroy(); } catch (e) {}
+        }
+      }
+    }
+    window.addEventListener('beforeunload', handleAppUnload);
+    window.addEventListener('pagehide', handleAppUnload);
 
     function downloadJSON(obj, filename) {
       const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
@@ -6401,8 +6425,11 @@
     // roll rather than locking the chest to that one item; walking onto it
     // again just rolls again.
     const CHEST_LOOT_TABLE = [
-      { weight: 75, type: 'gems', amount: 25 },
-      { weight: 5, type: 'item', itemName: 'Bomb' },
+      { weight: 20, type: 'gems', amount: 25 },
+      { weight: 20, type: 'gems', amount: 30 },
+      { weight: 15, type: 'gems', amount: 35 },
+      { weight: 15, type: 'gems', amount: 40 },
+      { weight: 10, type: 'item', itemName: 'Bomb' },
       { weight: 5, type: 'item', itemName: 'Pixie' },
       { weight: 5, type: 'item', itemName: 'Bottle' },
       { weight: 5, type: 'item', itemName: 'Energy Container' },
@@ -10054,9 +10081,12 @@
       if (mode === 'LOCAL') {
         document.getElementById('leave-lobby-btn').style.display = 'none';
         document.getElementById('player-list-panel').style.display = 'none';
+        if (hostWatchdogTimer) { clearInterval(hostWatchdogTimer); hostWatchdogTimer = null; }
+        if (clientHeartbeatTimer) { clearInterval(clientHeartbeatTimer); clientHeartbeatTimer = null; }
       } else {
         document.getElementById('leave-lobby-btn').style.display = 'inline-block';
         document.getElementById('player-list-panel').style.display = 'block';
+        if (mode === 'HOST') startHostWatchdog();
       }
       updateLeftToolbarVisibility();
 
@@ -11934,6 +11964,105 @@
       });
     }
 
+    let hostWatchdogTimer = null;
+    let clientHeartbeatTimer = null;
+    let clientLastHostMsg = 0;
+
+    function removePlayerFromGame(pid, reason) {
+      if (!pid || pid === myPlayerId) return;
+      const pName = (players[pid] && players[pid].name) || pid;
+      delete players[pid];
+      delete stepAcks[pid];
+      delete remotePlayerSheets[pid];
+      delete playerStatuses[pid];
+      delete activeEmotes[pid];
+      if (viewingPlayerId === pid) closeSheetViewer();
+      updatePlayerListUI();
+      broadcastToClients({ type: 'PLAYER_LEFT', playerId: pid });
+      removePlayerFromCombat(pid);
+      cleanupEmptyPortals();
+      showToast(`${pName} left the game.`);
+    }
+
+    function disconnectPlayerConnection(conn, reason) {
+      if (!conn) return;
+      const pid = conn.playerId;
+      conn.playerId = null; // Guard against duplicate calls
+      connections = connections.filter(c => c !== conn);
+      try { conn.close(); } catch (e) {}
+      if (pid) {
+        removePlayerFromGame(pid, reason);
+      }
+    }
+
+    function monitorPeerConnection(conn) {
+      if (!conn) return;
+      const setup = () => {
+        const pc = conn.peerConnection;
+        if (!pc || pc._monitored) return;
+        pc._monitored = true;
+        const checkState = () => {
+          const ice = pc.iceConnectionState;
+          const cs = pc.connectionState;
+          if (ice === 'failed' || ice === 'closed' || cs === 'failed' || cs === 'closed') {
+            disconnectPlayerConnection(conn, 'pc-' + (ice === 'failed' || ice === 'closed' ? ice : cs));
+          }
+        };
+        try {
+          pc.addEventListener('iceconnectionstatechange', checkState);
+          pc.addEventListener('connectionstatechange', checkState);
+        } catch (e) {}
+      };
+      setup();
+      if (!conn.peerConnection) {
+        setTimeout(setup, 150);
+        setTimeout(setup, 600);
+      }
+    }
+
+    function startHostWatchdog() {
+      if (hostWatchdogTimer) clearInterval(hostWatchdogTimer);
+      hostWatchdogTimer = setInterval(() => {
+        if (gameMode !== 'HOST') return;
+        const now = Date.now();
+        // 1. Check connections for timeout (5s after auth, 10s pre-auth)
+        [...connections].forEach(conn => {
+          const timeout = conn.authenticated ? 5000 : 10000;
+          if (conn.lastSeen && (now - conn.lastSeen > timeout)) {
+            disconnectPlayerConnection(conn, 'heartbeat-timeout');
+          }
+        });
+        // 2. Remove any orphaned remote player in players{} without an authenticated connection
+        Object.keys(players).forEach(pid => {
+          if (pid !== myPlayerId) {
+            const hasConn = connections.some(c => c.authenticated && c.playerId === pid);
+            if (!hasConn) {
+              removePlayerFromGame(pid, 'orphan-cleanup');
+            }
+          }
+        });
+      }, 1000);
+    }
+
+    function startClientHeartbeat() {
+      if (clientHeartbeatTimer) clearInterval(clientHeartbeatTimer);
+      clientLastHostMsg = Date.now();
+      clientHeartbeatTimer = setInterval(() => {
+        if (gameMode !== 'CLIENT') return;
+        if (hostConn && hostConn.open) {
+          try {
+            hostConn.send({ type: 'HEARTBEAT', playerId: myPlayerId });
+          } catch (e) {}
+        }
+        // If client hasn't received anything from host in 8s, host connection dropped
+        if (clientLastHostMsg && (Date.now() - clientLastHostMsg > 8000)) {
+          if (clientHeartbeatTimer) clearInterval(clientHeartbeatTimer);
+          clientHeartbeatTimer = null;
+          showModal("Disconnected", "Lost connection to the host.", () => closeGameAndReturn());
+        }
+      }, 2000);
+    }
+
     function hostLobby() {
       lobbyPassword = document.getElementById('host-pass').value.trim();
       if (!lobbyPassword) {
@@ -11971,22 +12100,21 @@
       });
 
       peer.on('connection', (conn) => {
+        conn.lastSeen = Date.now();
         conn.on('data', (data) => {
+          conn.lastSeen = Date.now();
           handleNetworkData(conn, data);
         });
 
         conn.on('close', () => {
-          connections = connections.filter(c => c !== conn);
-          if (conn.playerId) {
-            delete players[conn.playerId];
-            updatePlayerListUI();
-            broadcastToClients({ type: 'PLAYER_LEFT', playerId: conn.playerId });
-            removePlayerFromCombat(conn.playerId);
-            delete remotePlayerSheets[conn.playerId];
-            if (viewingPlayerId === conn.playerId) closeSheetViewer();
-            cleanupEmptyPortals();
-          }
+          disconnectPlayerConnection(conn, 'conn-close');
         });
+
+        conn.on('error', (err) => {
+          disconnectPlayerConnection(conn, 'conn-error');
+        });
+
+        monitorPeerConnection(conn);
       });
     }
 
@@ -12016,6 +12144,7 @@
 
         hostConn.on('open', () => {
           hostLinkOpened = true;
+          startClientHeartbeat();
           hostConn.send({
             type: 'JOIN_AUTH',
             version: GAME_VERSION,
@@ -12027,10 +12156,15 @@
         });
 
         hostConn.on('data', (data) => {
+          clientLastHostMsg = Date.now();
           handleNetworkData(hostConn, data);
         });
 
         hostConn.on('close', () => {
+          if (clientHeartbeatTimer) {
+            clearInterval(clientHeartbeatTimer);
+            clientHeartbeatTimer = null;
+          }
           // A kick already showed its own message and is already tearing the
           // session down via its own modal's close callback; avoid stacking
           // a second, generic "disconnected" notice on top of it.
@@ -12064,6 +12198,15 @@
 
     function handleNetworkData(conn, data) {
       if (gameMode === 'HOST') {
+        conn.lastSeen = Date.now();
+        if (data.type === 'HEARTBEAT') {
+          try { conn.send({ type: 'HEARTBEAT_ACK' }); } catch (e) {}
+          return;
+        }
+        if (data.type === 'LEAVE_LOBBY') {
+          disconnectPlayerConnection(conn, 'client-leave');
+          return;
+        }
         if (data.type === 'JOIN_AUTH') {
           // Different game versions can't play together — tell the joiner
           // why, then drop them (before the password is even checked).
@@ -12073,8 +12216,25 @@
             return;
           }
           if (data.password === lobbyPassword) {
+            // Remove any old ghost character with the same playerId or same name without an active connection
+            Object.keys(players).forEach(pid => {
+              if (pid !== myPlayerId) {
+                const isSameId = (pid === data.playerId);
+                const isSameName = (data.displayName && players[pid] && players[pid].name === data.displayName);
+                const oldConn = connections.find(c => c.playerId === pid);
+                if (isSameId || (isSameName && (!oldConn || !oldConn.open))) {
+                  if (oldConn) {
+                    connections = connections.filter(c => c !== oldConn);
+                    try { oldConn.close(); } catch (e) {}
+                  }
+                  removePlayerFromGame(pid, 'rejoin-replacement');
+                }
+              }
+            });
+
             conn.playerId = data.playerId;
             conn.authenticated = true;
+            conn.lastSeen = Date.now();
             connections.push(conn);
 
             const colorIdx = getAvailableColorIndex(data.preferredColorIndex);
@@ -12237,6 +12397,19 @@
       }
 
       if (gameMode === 'CLIENT') {
+        clientLastHostMsg = Date.now();
+        if (data.type === 'HEARTBEAT_ACK') {
+          return;
+        }
+        if (data.type === 'HOST_CLOSED') {
+          wasKicked = true;
+          if (clientHeartbeatTimer) {
+            clearInterval(clientHeartbeatTimer);
+            clientHeartbeatTimer = null;
+          }
+          showModal("Lobby Closed", "The host has closed the lobby.", () => closeGameAndReturn());
+          return;
+        }
         if (data.type === 'VERSION_MISMATCH' || (data.type === 'AUTH_OK' && data.hostVersion !== GAME_VERSION)) {
           // Also covers an older host that doesn't know about versions (its
           // AUTH_OK has no hostVersion): leave instead of joining a mismatch.
@@ -12411,8 +12584,14 @@
           if (!data.playerData.invisible) revealFogAround(data.playerData.activeSubMapKey || 'main', data.playerData.x, data.playerData.y);
           updatePlayerListUI();
         } else if (data.type === 'PLAYER_LEFT') {
+          const leavingName = (players[data.playerId] && players[data.playerId].name) || data.playerId;
           delete players[data.playerId];
+          delete remotePlayerSheets[data.playerId];
+          delete playerStatuses[data.playerId];
+          delete activeEmotes[data.playerId];
+          if (viewingPlayerId === data.playerId) closeSheetViewer();
           updatePlayerListUI();
+          showToast(`${leavingName} left the game.`);
         } else if (data.type === 'CHAT_MSG') {
           appendChatMessage(data.playerId, data.text, data.displayName);
         } else if (data.type === 'EDIT_PERMISSION') {
@@ -12505,8 +12684,27 @@
 
     function leaveLobby() {
       clearTimeout(peerReconnectTimer);
+      if (hostWatchdogTimer) {
+        clearInterval(hostWatchdogTimer);
+        hostWatchdogTimer = null;
+      }
+      if (clientHeartbeatTimer) {
+        clearInterval(clientHeartbeatTimer);
+        clientHeartbeatTimer = null;
+      }
+      if (gameMode === 'CLIENT' && hostConn) {
+        try {
+          hostConn.send({ type: 'LEAVE_LOBBY', playerId: myPlayerId });
+          hostConn.close();
+        } catch (e) {}
+      } else if (gameMode === 'HOST' && connections && connections.length) {
+        try {
+          broadcastToClients({ type: 'HOST_CLOSED' });
+          connections.forEach(c => { try { c.close(); } catch (e) {} });
+        } catch (e) {}
+      }
       if (peer) {
-        peer.destroy();
+        try { peer.destroy(); } catch (e) {}
         peer = null;
       }
       connections = [];
@@ -12528,6 +12726,7 @@
       startMode('LOCAL');
     }
   </script>
+<div id="ctx-menu"></div>
 <div id="ability-tooltip"></div>
 </body>
 </html>
